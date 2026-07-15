@@ -520,6 +520,7 @@ export class FiberImpl<A = any, E = any> implements Fiber.Fiber<A, E> {
     this._children = undefined
     this._interruptedCause = undefined
     this._yielded = undefined
+    this._running = false
     this.runtimeMetrics?.recordFiberStart(this.context)
   }
 
@@ -536,6 +537,7 @@ export class FiberImpl<A = any, E = any> implements Fiber.Fiber<A, E> {
   _children: Set<FiberImpl<any, any>> | undefined
   _interruptedCause: Cause.Cause<never> | undefined
   _yielded: Exit.Exit<any, any> | (() => void) | undefined
+  _running: boolean
 
   // set in setContext
   context!: Context.Context<never>
@@ -594,6 +596,9 @@ export class FiberImpl<A = any, E = any> implements Fiber.Fiber<A, E> {
   evaluate(effect: Primitive): void {
     if (this._exit) {
       return
+    } else if (this._running) {
+      this.currentDispatcher.scheduleTask(() => this.evaluate(effect), 0)
+      return
     } else if (this._yielded !== undefined) {
       const yielded = this._yielded as () => void
       this._yielded = undefined
@@ -602,6 +607,11 @@ export class FiberImpl<A = any, E = any> implements Fiber.Fiber<A, E> {
     const exit = this.runLoop(effect)
     if (exit === Yield) {
       return
+    }
+    // honor an interrupt that was deferred (via the `_running` branch) but never
+    // observed, rather than letting the scheduled task drop it against `_exit`
+    if (this.interruptible && this._interruptedCause !== undefined && exitIsSuccess(exit)) {
+      return this.evaluate(failCause(this._interruptedCause) as any)
     }
     // the interruptChildren middleware is added in Effect.forkChild, so it can be
     // tree-shaken if not used
@@ -621,6 +631,8 @@ export class FiberImpl<A = any, E = any> implements Fiber.Fiber<A, E> {
   runLoop(effect: Primitive): Exit.Exit<A, E> | Yield {
     const prevFiber = (globalThis as any)[currentFiberTypeId]
     ;(globalThis as any)[currentFiberTypeId] = this
+    const prevRunning = this._running
+    this._running = true
     let yielding = false
     let current: Primitive | Yield = effect
     this.currentOpCount = 0
@@ -658,6 +670,7 @@ export class FiberImpl<A = any, E = any> implements Fiber.Fiber<A, E> {
       }
       return this.runLoop(exitDie(error) as any)
     } finally {
+      this._running = prevRunning
       ;(globalThis as any)[currentFiberTypeId] = prevFiber
     }
   }
@@ -851,10 +864,11 @@ export const fiberInterruptAll = <A extends Iterable<Fiber.Fiber<any, any>>>(
 ): Effect.Effect<void> =>
   withFiber((parent) => {
     const annotations = fiberStackAnnotations(parent)
-    for (const fiber of fibers) {
+    const arr = Arr.fromIterable(fibers)
+    for (const fiber of arr) {
       fiber.interruptUnsafe(parent.id, annotations)
     }
-    return asVoid(fiberAwaitAll(fibers))
+    return asVoid(fiberAwaitAll(arr))
   })
 
 /** @internal */
@@ -867,8 +881,9 @@ export const fiberInterruptAllAs: {
 ): Effect.Effect<void> =>
   withFiber((parent) => {
     const annotations = fiberStackAnnotations(parent)
-    for (const fiber of fibers) fiber.interruptUnsafe(fiberId, annotations)
-    return asVoid(fiberAwaitAll(fibers))
+    const arr = Arr.fromIterable(fibers)
+    for (const fiber of arr) fiber.interruptUnsafe(fiberId, annotations)
+    return asVoid(fiberAwaitAll(arr))
   }))
 
 /** @internal */
